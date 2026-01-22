@@ -43,6 +43,7 @@
       direction: rtl;
       text-align: right;
     }
+
     h2 {
       font-size: 1.4rem;
       margin-bottom: 14px;
@@ -63,36 +64,46 @@
 
   <main class="container">
     <div class="meta" id="meta">ލޯޑް ވަނީ</div>
-    <h2 id="title">އެންމެފަހުގެ ހަބަރު ލޯޑް ވަނީ</h2>
+    <h2 id="title">ހަބަރު ލޯޑް ވަނީ...</h2>
     <div id="content"></div>
   </main>
 
   <script>
-    async function loadLatest() {
+    async function loadRandomUnique() {
       try {
-        const res = await fetch("/api/latest-news");
+        // last served article (to avoid repeating on refresh)
+        const lastUrl = localStorage.getItem("lastUrl") || "";
+
+        const res = await fetch("/api/random-article?last=" + encodeURIComponent(lastUrl));
         const data = await res.json();
 
-        document.getElementById("title").textContent = data.title;
+        if (data.error) throw new Error(data.detail || data.error);
 
+        // title
+        document.getElementById("title").textContent = data.title || "ހަބަރު";
+
+        // content
         const contentDiv = document.getElementById("content");
         contentDiv.innerHTML = "";
 
-        data.content.forEach(text => {
+        (data.content || []).forEach(text => {
           const p = document.createElement("p");
           p.textContent = text;
           contentDiv.appendChild(p);
         });
 
-        document.getElementById("meta").textContent =
-          (data.cached ? "ވަގުތުން" : "ވަގުތުން");
+        // save last url to avoid showing same twice
+        localStorage.setItem("lastUrl", data.url);
+
+        // meta (simple)
+        document.getElementById("meta").textContent = "ވަގުތުން";
       } catch (err) {
         document.getElementById("meta").textContent = "⚠️ Failed to load";
       }
     }
 
-    loadLatest();
-    setInterval(loadLatest, 120000); // auto refresh every 2 min
+    loadRandomUnique(); // on page load / refresh
+    // no auto refresh (since you want refresh-based new article)
   </script>
 
 </body>

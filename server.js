@@ -51,7 +51,7 @@ async function fetchGridUrls() {
   }
 
   // 1) Load Mihaaru news page (the one with your grid)
-  const homeRes = await fetch(`${BASE}/news`, {
+  const homeRes = await fetch(`${BASE}`, {
     headers: { "User-Agent": "Mozilla/5.0" }
   });
   const homeHtml = await homeRes.text();
@@ -61,12 +61,14 @@ async function fetchGridUrls() {
   // Works with: <div id="news-grid-XXXX-items"> ... <article> ... <a href="/news/153681">
   const found = [];
 
-  $(`div[id^="news-grid-"][id$="-items"] article a[href^="/news/"]`).each((_, a) => {
-    const href = $(a).attr("href");
-    if (href && /^\/news\/\d+/.test(href)) {
-      found.push(`${BASE}${href}`);
-    }
-  });
+$('article a[href^="/"]').each((_, a) => {
+  const href = $(a).attr("href");
+  if (!href) return;
+
+  if (/^\/(news|world|sports|business|local)\/\d+/.test(href)) {
+    found.push(`${BASE}${href}`);
+  }
+});
 
   const urls = uniq(found).slice(0, 12); // first 12 articles from that grid
 

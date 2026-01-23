@@ -132,7 +132,7 @@ async function fetchArticle(url) {
     content:
       content.length
         ? content
-        : ["މި ލިޔުމުގެ ނައްސަތް މިހާރު ސާފުކޮށް ނުލިބޭ. ލިންކަށް ހިނގާ."],
+        : ["ލިޔުމެއް ނުފެނުނު"],
     fetchedAt: new Date().toISOString()
   };
 

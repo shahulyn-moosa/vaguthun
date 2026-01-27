@@ -1,33 +1,58 @@
+# server.py
+import os
+import re
+import time
+import json
+import random
+import asyncio
+from datetime import datetime
+from typing import Optional, Dict, Any
+
 import aiohttp
 from bs4 import BeautifulSoup
 from quart import Quart, jsonify, request, send_from_directory
-import time
-import random
-import re
-import asyncio
-from datetime import datetime
+
+# Parquet persistence
+import pandas as pd
 
 app = Quart(__name__, static_folder="public", static_url_path="")
+
 BASE = "https://mihaaru.com"
 
-# ===== CACHES =====
-LIST_TTL = 10 * 60 * 1000      # 10 min
-ARTICLE_TTL = 30 * 60 * 1000   # 30 min
+# ===== CACHE SETTINGS =====
+LIST_TTL_MS = 10 * 60 * 1000       # 10 min list refresh
+ARTICLE_TTL_MS = 30 * 60 * 1000    # 30 min per-article TTL
 
-list_cache = {"urls": [], "timestamp": 0}
-article_cache = {}  # url -> { data, ts }
+# how many links to keep from homepage grid scan
+MAX_URLS = 30
+# how many articles to prefetch into cache (best to keep small)
+PREFETCH_TARGET = 20
 
-_http_session: aiohttp.ClientSession | None = None
+# background refresh cadence
+BG_LOOP_EVERY_SEC = 30
+# do not save parquet more often than this
+PARQUET_SAVE_MIN_INTERVAL_SEC = 15
 
+CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
+CACHE_FILE = os.path.join(CACHE_DIR, "articles.parquet")
+
+# ===== IN-MEMORY CACHES =====
+list_cache = {"urls": [], "timestamp": 0}  # timestamp in ms
+article_cache: Dict[str, Dict[str, Any]] = {}  # url -> {"data": dict, "ts": ms}
+
+_http_session: Optional[aiohttp.ClientSession] = None
+_bg_task: Optional[asyncio.Task] = None
+_cache_lock = asyncio.Lock()
+_last_parquet_save_ts = 0.0
+
+# Only allow real article URLs (Mihaaru uses /news/<id> etc)
 ARTICLE_RE = re.compile(r"^/(news|world|sports|business|local)/\d+/?$")
 
-# How many articles to prefetch in the background
-PREFETCH_COUNT = 6
-# How many concurrent background fetches allowed
-PREFETCH_CONCURRENCY = 3
 
-
-def now_ms():
+# ----------------------------
+# Utilities
+# ----------------------------
+def now_ms() -> int:
     return int(time.time() * 1000)
 
 
@@ -48,6 +73,139 @@ def pick_random(arr, avoid=None):
     return random.choice(pool)
 
 
+def to_json_list(val):
+    """Convert content into a JSON-serializable Python list of strings."""
+    if val is None:
+        return []
+
+    # numpy array -> list (happens when reading from parquet)
+    try:
+        import numpy as np  # type: ignore
+        if isinstance(val, np.ndarray):
+            val = val.tolist()
+    except Exception:
+        pass
+
+    # pandas / tuple / set -> list
+    if isinstance(val, (tuple, set)):
+        val = list(val)
+
+    # single string -> [string]
+    if isinstance(val, str):
+        return [val]
+
+    # list-like -> ensure strings
+    if isinstance(val, list):
+        out = []
+        for x in val:
+            if x is None:
+                continue
+            if isinstance(x, list):
+                out.extend([str(i) for i in x if i is not None])
+            else:
+                out.append(str(x))
+        return out
+
+    # fallback
+    return [str(val)]
+
+
+def normalize_article(data: dict) -> dict:
+    """Ensure article dict is always JSON-safe and consistent."""
+    data = dict(data or {})
+    data["url"] = str(data.get("url", ""))
+    data["title"] = str(data.get("title", "ލިޔުމެއް"))
+    data["content"] = to_json_list(data.get("content"))
+    data["fetchedAt"] = str(data.get("fetchedAt", datetime.now().isoformat()))
+    return data
+
+
+def ensure_cache_dir():
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+# ----------------------------
+# Parquet persistence
+# ----------------------------
+def load_parquet_cache():
+    """Load cached articles from parquet into memory (best-effort)."""
+    global article_cache
+    ensure_cache_dir()
+    if not os.path.exists(CACHE_FILE):
+        return
+
+    try:
+        df = pd.read_parquet(CACHE_FILE)
+        loaded = 0
+
+        for _, row in df.iterrows():
+            url = str(row.get("url", "")).strip()
+            if not url:
+                continue
+
+            data = {
+                "url": url,
+                "title": row.get("title", "ލިޔުމެއް"),
+                "content": row.get("content", []),
+                "fetchedAt": row.get("fetchedAt", datetime.now().isoformat()),
+            }
+            data = normalize_article(data)
+
+            ts_val = row.get("ts", now_ms())
+            try:
+                ts_val = int(ts_val)
+            except Exception:
+                ts_val = now_ms()
+
+            article_cache[url] = {"data": data, "ts": ts_val}
+            loaded += 1
+
+        if loaded:
+            print(f"Loaded {loaded} cached articles from {CACHE_FILE}")
+    except Exception as e:
+        print(f"WARNING: Failed to load parquet cache: {e}")
+
+
+async def save_parquet_cache_throttled():
+    """Save parquet cache but throttle writes to avoid frequent disk IO."""
+    global _last_parquet_save_ts
+    now = time.time()
+    if now - _last_parquet_save_ts < PARQUET_SAVE_MIN_INTERVAL_SEC:
+        return
+
+    async with _cache_lock:
+        # check again inside lock
+        now2 = time.time()
+        if now2 - _last_parquet_save_ts < PARQUET_SAVE_MIN_INTERVAL_SEC:
+            return
+
+        if not article_cache:
+            return
+
+        ensure_cache_dir()
+        rows = []
+        for url, entry in article_cache.items():
+            d = normalize_article(entry.get("data", {}))
+            rows.append(
+                {
+                    "url": d["url"],
+                    "title": d["title"],
+                    "content": d["content"],   # always plain list now
+                    "fetchedAt": d["fetchedAt"],
+                    "ts": int(entry.get("ts", now_ms())),
+                }
+            )
+
+        try:
+            pd.DataFrame(rows).to_parquet(CACHE_FILE, index=False)
+            _last_parquet_save_ts = time.time()
+        except Exception as e:
+            print(f"WARNING: Failed to save parquet cache: {e}")
+
+
+# ----------------------------
+# HTTP session lifecycle
+# ----------------------------
 async def get_session():
     global _http_session
     if _http_session is None or _http_session.closed:
@@ -58,87 +216,77 @@ async def get_session():
 
 @app.before_serving
 async def startup():
+    load_parquet_cache()
     await get_session()
-    # Warm caches in background so first user doesn't wait
-    asyncio.create_task(warm_cache())
+    # kick background loop
+    global _bg_task
+    _bg_task = asyncio.create_task(background_cache_loop())
 
 
 @app.after_serving
 async def shutdown():
-    global _http_session
+    global _http_session, _bg_task
+    if _bg_task:
+        _bg_task.cancel()
+        _bg_task = None
+
     if _http_session and not _http_session.closed:
         await _http_session.close()
     _http_session = None
 
 
-async def warm_cache():
-    """
-    Background: refresh URL list + prefetch a few articles into cache.
-    """
-    try:
-        urls = await fetch_grid_urls(force=True)
-        if not urls:
-            return
-
-        # Prefetch first N URLs (or random sample)
-        targets = urls[:PREFETCH_COUNT]
-
-        sem = asyncio.Semaphore(PREFETCH_CONCURRENCY)
-
-        async def _prefetch_one(u):
-            async with sem:
-                try:
-                    await fetch_article(u, allow_stale_return=False)
-                except Exception:
-                    pass
-
-        await asyncio.gather(*[_prefetch_one(u) for u in targets])
-    except Exception:
-        pass
-
-
-async def fetch_grid_urls(force: bool = False):
+# ----------------------------
+# Mihaaru scraping
+# ----------------------------
+async def fetch_homepage_urls() -> list[str]:
+    """Fetch article URLs from mihaaru.com homepage (NOT /news)."""
     now = now_ms()
 
-    # Use cached list if fresh
-    if (not force) and list_cache["urls"] and (now - list_cache["timestamp"]) < LIST_TTL:
+    # use cached list if still fresh
+    if list_cache["urls"] and (now - list_cache["timestamp"]) < LIST_TTL_MS:
         return list_cache["urls"]
 
     headers = {"User-Agent": "Mozilla/5.0"}
     session = await get_session()
 
-    async with session.get(BASE, headers=headers) as home_res:
-        home_html = await home_res.text()
+    async with session.get(BASE, headers=headers) as res:
+        html = await res.text()
 
-    soup = BeautifulSoup(home_html, "html.parser")
-    found = []
+    soup = BeautifulSoup(html, "html.parser")
+    found: list[str] = []
 
-    # Prefer links inside visible grid content first
-    grid = soup.select_one("div.grid.grid-cols-2")
-    if grid:
-        for a in grid.select('article a[href^="/"]'):
-            href = a.get("href", "")
-            if ARTICLE_RE.match(href):
-                found.append(f"{BASE}{href}")
+    # Prefer visible grid sections first
+    # Your page may change; we do layered fallbacks.
+    grids = soup.select("div.grid, section, main")
 
-    # Fallback 1: any article blocks on page
+    def add_href(href: str):
+        if not href:
+            return
+        if href.startswith("http://") or href.startswith("https://"):
+            if href.startswith(BASE):
+                found.append(href)
+            return
+        if href.startswith("/") and ARTICLE_RE.match(href):
+            found.append(f"{BASE}{href}")
+
+    # 1) scan articles inside grid-like areas
+    for g in grids[:6]:
+        for a in g.select('article a[href]'):
+            add_href(a.get("href", ""))
+
+    # 2) fallback: scan all <article>
     if not found:
         for art in soup.find_all("article"):
             a = art.find("a", href=True)
-            if not a:
-                continue
-            href = a.get("href", "")
-            if ARTICLE_RE.match(href):
-                found.append(f"{BASE}{href}")
+            if a:
+                add_href(a.get("href", ""))
 
-    # Fallback 2: scan all anchors
+    # 3) fallback: scan all anchors
     if not found:
         for a in soup.find_all("a", href=True):
-            href = a.get("href", "")
-            if ARTICLE_RE.match(href):
-                found.append(f"{BASE}{href}")
+            add_href(a.get("href", ""))
 
-    urls = uniq(found)[:12]
+    urls = uniq(found)[:MAX_URLS]
     if not urls:
         raise Exception("No article links found on mihaaru.com homepage")
 
@@ -147,77 +295,8 @@ async def fetch_grid_urls(force: bool = False):
     return urls
 
 
-def get_cached_any(prefer_fresh: bool = True):
-    """
-    Return any cached article (fresh preferred), else stale, else None.
-    """
-    if not article_cache:
-        return None
-
-    now = now_ms()
-
-    fresh = []
-    stale = []
-
-    for url, entry in article_cache.items():
-        age = now - entry["ts"]
-        if age < ARTICLE_TTL:
-            fresh.append(entry["data"])
-        else:
-            stale.append(entry["data"])
-
-    if prefer_fresh and fresh:
-        picked = random.choice(fresh)
-        return {**picked, "cachedArticle": True, "stale": False}
-
-    if fresh:
-        picked = random.choice(fresh)
-        return {**picked, "cachedArticle": True, "stale": False}
-
-    if stale:
-        picked = random.choice(stale)
-        return {**picked, "cachedArticle": True, "stale": True}
-
-    return None
-
-
-async def fetch_article(url, allow_stale_return: bool = True):
-    """
-    Fetch article. If cached and fresh -> return cached immediately.
-    If cached but stale and allow_stale_return -> return stale immediately AND refresh in background.
-    Otherwise fetch now.
-    """
-    now = now_ms()
-
-    cached = article_cache.get(url)
-    if cached:
-        age = now - cached["ts"]
-        if age < ARTICLE_TTL:
-            return {**cached["data"], "cachedArticle": True, "stale": False}
-
-        if allow_stale_return:
-            # Return stale immediately, refresh in background
-            asyncio.create_task(_refresh_article(url))
-            return {**cached["data"], "cachedArticle": True, "stale": True}
-
-    # Not cached -> fetch now
-    data = await _download_article(url)
-    article_cache[url] = {"data": data, "ts": now_ms()}
-    return {**data, "cachedArticle": False, "stale": False}
-
-
-async def _refresh_article(url):
-    """
-    Background refresh for a single article.
-    """
-    try:
-        data = await _download_article(url)
-        article_cache[url] = {"data": data, "ts": now_ms()}
-    except Exception:
-        pass
-
-
-async def _download_article(url):
+async def download_article(url: str) -> dict:
+    """Fetch and parse one article page."""
     headers = {"User-Agent": "Mozilla/5.0"}
     session = await get_session()
 
@@ -231,7 +310,7 @@ async def _download_article(url):
     if h1:
         title = h1.get_text(strip=True)
 
-    content = []
+    content: list[str] = []
 
     def push_text(t):
         if not t:
@@ -257,14 +336,96 @@ async def _download_article(url):
         for p in soup.find_all("p")[:25]:
             push_text(p.get_text())
 
-    return {
+    data = {
         "url": url,
         "title": title or "ލިޔުމެއް",
         "content": content or ["ލިޔުމެއް ނުފެނުނު"],
         "fetchedAt": datetime.now().isoformat(),
     }
 
+    return normalize_article(data)
 
+
+async def fetch_article_cached_or_download(url: str) -> dict:
+    """Return cached if fresh, else download and update cache."""
+    now = now_ms()
+    cached = article_cache.get(url)
+    if cached and (now - int(cached.get("ts", 0))) < ARTICLE_TTL_MS:
+        d = normalize_article(cached.get("data", {}))
+        return {**d, "cachedArticle": True}
+
+    data = await download_article(url)
+
+    async with _cache_lock:
+        article_cache[url] = {"data": data, "ts": now_ms()}
+
+    asyncio.create_task(save_parquet_cache_throttled())
+    return {**data, "cachedArticle": False}
+
+
+def get_random_cached_article(avoid_url: Optional[str] = None) -> Optional[dict]:
+    """Pick a random cached article (prefer fresh, but can serve stale if offline)."""
+    if not article_cache:
+        return None
+
+    urls = list(article_cache.keys())
+    if avoid_url and avoid_url in urls and len(urls) > 1:
+        urls = [u for u in urls if u != avoid_url] or urls
+
+    picked = random.choice(urls)
+    data = normalize_article(article_cache[picked].get("data", {}))
+    return data
+
+
+# ----------------------------
+# Background cache loop
+# ----------------------------
+async def background_refresh_once():
+    """
+    Best-effort:
+    - refresh homepage URL list (if needed)
+    - prefetch up to PREFETCH_TARGET articles into cache
+    """
+    try:
+        urls = await fetch_homepage_urls()
+    except Exception as e:
+        # offline or blocked; keep serving parquet cache
+        print(f"BG: homepage fetch failed (offline ok): {e}")
+        return
+
+    # prefetch
+    want = urls[:PREFETCH_TARGET]
+    random.shuffle(want)
+
+    # limit concurrency
+    sem = asyncio.Semaphore(4)
+
+    async def worker(u):
+        async with sem:
+            try:
+                await fetch_article_cached_or_download(u)
+            except Exception as e:
+                print(f"BG: article fetch failed for {u}: {e}")
+
+    await asyncio.gather(*(worker(u) for u in want), return_exceptions=True)
+
+
+async def background_cache_loop():
+    """Runs forever; keeps cache warm without blocking user requests."""
+    while True:
+        try:
+            await background_refresh_once()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print(f"BG loop error: {e}")
+
+        await asyncio.sleep(BG_LOOP_EVERY_SEC)
+
+
+# ----------------------------
+# Routes
+# ----------------------------
 @app.route("/")
 async def index():
     return await send_from_directory("public", "index.html")
@@ -272,44 +433,70 @@ async def index():
 
 @app.route("/api/random-article")
 async def random_article():
-    try:
-        last = request.args.get("last", "").strip()
+    """
+    ALWAYS respond quickly:
+    1) If we have any cached article (parquet or memory), serve it immediately.
+       In parallel, refresh cache in background.
+    2) If cache is empty, try online fetch; if offline, return a clear error.
+    """
+    last = request.args.get("last", "").strip()
+    last_url = last if last.startswith("http") else None
 
-        urls = await fetch_grid_urls()
-        picked = pick_random(urls, last or None)
+    # 1) Serve cached immediately if available (offline-safe)
+    cached = get_random_cached_article(avoid_url=last_url)
+    if cached:
+        # warm cache in background (non-blocking)
+        asyncio.create_task(background_refresh_once())
+        return jsonify(
+            {
+                **normalize_article(cached),
+                "servedFrom": "cache",
+                "offlineSafe": True,
+                "cachedList": True,  # we have something usable
+            }
+        )
+
+    # 2) If no cache exists at all, try to fetch live (might fail offline)
+    try:
+        urls = await fetch_homepage_urls()
+        picked = pick_random(urls, last_url)
         if not picked:
             raise Exception("Failed to pick random article")
 
-        # ✅ If picked is cached (fresh OR stale) return immediately
-        # But if it isn't cached at all, return any cached article immediately
-        # and fetch picked in background.
-        if picked in article_cache:
-            article = await fetch_article(picked, allow_stale_return=True)
-        else:
-            fallback = get_cached_any(prefer_fresh=True)
-            if fallback:
-                # start caching the picked one in background
-                asyncio.create_task(_refresh_article(picked))
-                article = {
-                    **fallback,
-                    "fallback": True,
-                    "requestedUrl": picked,
-                }
-            else:
-                # No cache at all yet (first ever request) -> fetch once
-                article = await fetch_article(picked, allow_stale_return=False)
+        article = await fetch_article_cached_or_download(picked)
 
-        now = now_ms()
+        return jsonify(
+            {
+                **normalize_article(article),
+                "servedFrom": "live",
+                "offlineSafe": False,
+                "cachedList": True,
+            }
+        )
+    except Exception as e:
+        return jsonify(
+            {
+                "error": "No cached articles available and mihaaru.com is not reachable",
+                "detail": str(e),
+                "offlineSafe": False,
+            }
+        ), 503
 
-        return jsonify({
-            **article,
-            "cachedList": (now - list_cache["timestamp"]) < LIST_TTL,
-            "cacheSize": len(article_cache),
-        })
 
-    except Exception as err:
-        return jsonify({"error": "Failed to load random article", "detail": str(err)}), 500
+@app.route("/api/cache-status")
+async def cache_status():
+    """Small helper endpoint to see cache size quickly."""
+    return jsonify(
+        {
+            "cachedArticles": len(article_cache),
+            "listCached": len(list_cache["urls"]),
+            "cacheFile": CACHE_FILE,
+            "hasCacheFile": os.path.exists(CACHE_FILE),
+        }
+    )
 
 
 if __name__ == "__main__":
-    app.run(debug=False, host="0.0.0.0", port=3000)
+    # Development only. In production use hypercorn/uvicorn behind nginx.
+    #app.run(debug=False, host="0.0.0.0", port=3000)
+    app.run(debug=False, host="localhost", port=3000)

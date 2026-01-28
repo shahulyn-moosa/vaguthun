@@ -56,6 +56,18 @@
       background: #ef4444;
       display: inline-block;
       flex: 0 0 auto;
+      animation: sourceDotPulse 1.4s ease-in-out infinite;
+      box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.35);
+    }
+
+    @keyframes sourceDotPulse {
+      0%   { transform: scale(0.9); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.35); }
+      60%  { transform: scale(1.0); box-shadow: 0 0 0 8px rgba(239, 68, 68, 0.00); }
+      100% { transform: scale(0.9); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.00); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .source-dot { animation: none; }
     }
 
     h1 {

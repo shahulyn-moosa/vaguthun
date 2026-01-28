@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Latest Mihaaru News</title>
+  <title>News</title>
 
   <style>
     @font-face {
@@ -22,6 +22,7 @@
     }
 
     .container {
+      position: relative; /* needed for bottom-left tag */
       max-width: 480px;
       margin: auto;
       background: #fff;
@@ -35,6 +36,26 @@
       color: #777;
       margin-bottom: 12px;
       direction: ltr;
+    }
+
+    .source-text {
+      position: absolute;
+      bottom: 15px;
+      left: 12px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 0;
+      direction: ltr;
+    }
+
+    .source-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 999px;
+      background: #ef4444;
+      display: inline-block;
+      flex: 0 0 auto;
     }
 
     h1 {
@@ -58,18 +79,38 @@
       direction: rtl;
       text-align: right;
     }
+
+    /* source tag removed */
   </style>
 </head>
-<body>
 
+<body>
   <main class="container">
     <div class="meta" id="meta">ވަގުތުން</div>
     <h2 id="title">ޚަބަރު ލޯޑް ވަނީ... </h2>
     <div id="content"></div>
+    <div class="meta source-text">
+      <span class="source-dot" aria-hidden="true"></span>
+      <span id="sourceText">News</span>
+    </div>
+
   </main>
 
   <script>
+    function detectSource(url = "") {
+      const u = (url || "").toLowerCase();
+      if (u.includes("mihaaru.com")) return "މިހާރު";
+      if (u.includes("sun.mv"))     return "ސަން";
+      if (u.includes("vaguthu.mv")) return "ވަގުތު";
+      return "News";
+    }
+
     async function loadRandomUnique() {
+      const metaEl = document.getElementById("meta");
+      const titleEl = document.getElementById("title");
+      const contentDiv = document.getElementById("content");
+      const sourceText = document.getElementById("sourceText");
+
       try {
         // last served article (to avoid repeating on refresh)
         const lastUrl = localStorage.getItem("lastUrl") || "";
@@ -80,12 +121,10 @@
         if (data.error) throw new Error(data.detail || data.error);
 
         // title
-        document.getElementById("title").textContent = data.title || "ހަބަރު";
+        titleEl.textContent = data.title || "ހަބަރު";
 
         // content
-        const contentDiv = document.getElementById("content");
         contentDiv.innerHTML = "";
-
         (data.content || []).forEach(text => {
           const p = document.createElement("p");
           p.textContent = text;
@@ -93,18 +132,21 @@
         });
 
         // save last url to avoid showing same twice
-        localStorage.setItem("lastUrl", data.url);
+        if (data.url) localStorage.setItem("lastUrl", data.url);
 
-        // meta (simple)
-        document.getElementById("meta").textContent = "ވަގުތުން";
+        // meta
+        metaEl.textContent = "ވަގުތުން";
+
+        // source text (bottom-right)
+        sourceText.textContent = detectSource(data.url || "");
+
       } catch (err) {
-        document.getElementById("meta").textContent = "ޚަބަރު ލޯޑް ވުމުގަ މައްސަލައެއް އެބައުޅޭ";
+        metaEl.textContent = "ޚަބަރު ލޯޑް ވުމުގަ މައްސަލައެއް އެބައުޅޭ";
       }
     }
 
     loadRandomUnique(); // on page load / refresh
-    //created by shahulyn | datawavemaldives.com
+    // created by shahulyn | datawavemaldives.com
   </script>
-
 </body>
 </html>

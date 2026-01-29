@@ -22,7 +22,7 @@
     }
 
     .container {
-      position: relative;
+      position: relative; /* needed for bottom-left tag */
       max-width: 480px;
       margin: auto;
       background: #fff;
@@ -66,6 +66,17 @@
       100% { transform: scale(0.9); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.00); }
     }
 
+    @media (prefers-reduced-motion: reduce) {
+      .source-dot { animation: none; }
+    }
+
+    h1 {
+      font-size: 1.6rem;
+      margin-bottom: 14px;
+      direction: rtl;
+      text-align: right;
+    }
+
     h2 {
       font-size: 1.4rem;
       margin-bottom: 14px;
@@ -81,65 +92,7 @@
       text-align: right;
     }
 
-    .refresh-btn {
-  position: fixed;
-  bottom: 18px;
-  right: 18px;
-  width: 46px;
-  height: 46px;
-  border-radius: 999px;
-
-  /* Real glass surface */
-  background: linear-gradient(
-    180deg,
-    rgba(255,255,255,0.35),
-    rgba(255,255,255,0.18)
-  );
-
-  backdrop-filter: blur(3px) saturate(185%);
-  -webkit-backdrop-filter: blur(3px) saturate(185%);
-
-  /* Glass edges */
-  border: 1px solid rgba(255,255,255,0.5);
-  box-shadow:
-    0 10px 26px rgba(0,0,0,0.14),
-    inset 0 1px 0 rgba(255,255,255,0.6),
-    inset 0 -1px 0 rgba(255,255,255,0.15);
-
-  color: #0ea5a4;
-  font-size: 22px;
-
-  display: flex;
-  align-items: center;
-  justify-content: center;
-
-  z-index: 999;
-  cursor: pointer;
-  transition: transform 0.2s ease;
-}
-
-.refresh-btn:active {
-  transform: scale(0.94);
-}
-
-
-
-    /* One-time hint animation */
-    .refresh-btn.hint {
-      animation: hintPop 1.2s ease;
-    }
-
-    @keyframes hintPop {
-      0%   { transform: scale(0.8); opacity: 0; }
-      60%  { transform: scale(1.1); opacity: 1; }
-      100% { transform: scale(1); }
-    }
-
-    @media (prefers-reduced-motion: reduce) {
-      .refresh-btn.hint {
-        animation: none;
-      }
-    }
+    /* source tag removed */
   </style>
 </head>
 
@@ -148,17 +101,12 @@
     <div class="meta" id="meta">ވަގުތުން</div>
     <h2 id="title">ޚަބަރު ލޯޑް ވަނީ... </h2>
     <div id="content"></div>
-
     <div class="meta source-text">
       <span class="source-dot" aria-hidden="true"></span>
-      <span id="sourceText">ޚަބަރު ތަށް ވަގުތުން</span>
+      <span id="sourceText">News</span>
     </div>
-  </main>
 
-  <!-- Frosted refresh -->
-  <button class="refresh-btn" onclick="loadRandomUnique()" aria-label="New article">
-    ⟳
-  </button>
+  </main>
 
   <script>
     function detectSource(url = "") {
@@ -176,41 +124,41 @@
       const sourceText = document.getElementById("sourceText");
 
       try {
+        // last served article (to avoid repeating on refresh)
         const lastUrl = localStorage.getItem("lastUrl") || "";
+
         const res = await fetch("/api/random-article?last=" + encodeURIComponent(lastUrl));
         const data = await res.json();
 
         if (data.error) throw new Error(data.detail || data.error);
 
+        // title
         titleEl.textContent = data.title || "ހަބަރު";
-        contentDiv.innerHTML = "";
 
+        // content
+        contentDiv.innerHTML = "";
         (data.content || []).forEach(text => {
           const p = document.createElement("p");
           p.textContent = text;
           contentDiv.appendChild(p);
         });
 
+        // save last url to avoid showing same twice
         if (data.url) localStorage.setItem("lastUrl", data.url);
 
+        // meta
         metaEl.textContent = "ވަގުތުން";
-        sourceText.textContent = detectSource(data.url || "");
 
-        window.scrollTo({ top: 0, behavior: "smooth" });
+        // source text (bottom-right)
+        sourceText.textContent = detectSource(data.url || "");
 
       } catch (err) {
         metaEl.textContent = "ޚަބަރު ލޯޑް ވުމުގަ މައްސަލައެއް އެބައުޅޭ";
       }
     }
 
-    // First-load hint only
-    window.addEventListener("load", () => {
-      const btn = document.querySelector(".refresh-btn");
-      btn.classList.add("hint");
-      setTimeout(() => btn.classList.remove("hint"), 1200);
-    });
-
-    loadRandomUnique();
+    loadRandomUnique(); // on page load / refresh
+    // created by shahulyn | datawavemaldives.com
   </script>
 </body>
 </html>
